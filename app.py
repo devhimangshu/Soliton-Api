@@ -87,7 +87,7 @@ def create_payload(uid, region):
 
 # ---------------- LIKE REQUEST ---------------- #
 
-async def send_single(session, encrypted, token_dict, url):
+async def send_single(sem, encrypted, token_dict, url):
     token = token_dict.get("token", "")
     if not token:
         return 999
@@ -98,31 +98,34 @@ async def send_single(session, encrypted, token_dict, url):
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    try:
-        # ssl=False is required for some game API endpoints to prevent handshake drops
-        async with session.post(
-            url,
-            data=bytes.fromhex(encrypted),
-            headers=headers,
-            ssl=False
-        ) as res:
-            return res.status
-    except Exception:
-        return 998
+    # The semaphore limits concurrency so Vercel doesn't run out of memory/sockets
+    async with sem:
+        try:
+            # We use a fresh session for each request. 
+            # Reusing a single session with different Bearer tokens gets blocked by the game's firewall.
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.post(
+                    url,
+                    data=bytes.fromhex(encrypted),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as res:
+                    return res.status
+        except Exception as e:
+            print(f"Request error: {e}")
+            return 998
 
 
 async def send_batch(uid, region, url, tokens):
     payload = create_payload(uid, region)
     encrypted = encrypt_message(payload)
 
-    # Vercel Fix: Create ONE single session for the entire batch.
-    # Opening 100 separate ClientSessions concurrently will cause timeout errors.
-    timeout = aiohttp.ClientTimeout(total=15)
-    connector = aiohttp.TCPConnector(limit=TOKEN_BATCH_SIZE, ssl=False)
+    # Use a semaphore to limit simultaneous connections (Max 50 at a time)
+    sem = asyncio.Semaphore(50)
     
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [send_single(session, encrypted, t, url) for t in tokens]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [send_single(sem, encrypted, t, url) for t in tokens]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Count actual HTTP 200 Success responses directly from the server
     success = sum(1 for r in results if isinstance(r, int) and r == 200)
@@ -157,7 +160,6 @@ def like():
     else:
         url = "https://clientbp.ggblueshark.com/LikeProfile"
 
-    # Use asyncio.run for cleaner and safer execution in synchronous Flask environments
     try:
         success, failed = asyncio.run(send_batch(uid, server, url, batch))
     except Exception as e:
