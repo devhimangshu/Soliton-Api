@@ -87,51 +87,59 @@ def create_payload(uid, region):
 
 # ---------------- LIKE REQUEST ---------------- #
 
-async def send_single(sem, encrypted, token_dict, url):
+async def send_single(session, sem, encrypted, token_dict, url):
     token = token_dict.get("token", "")
     if not token:
-        return 999
+        return "Missing Token"
 
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "Dalvik/2.1.0",
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Connection": "close"  # Bypasses Cloudflare block without needing multiple sessions
     }
 
-    # The semaphore limits concurrency so Vercel doesn't run out of memory/sockets
     async with sem:
         try:
-            # We use a fresh session for each request. 
-            # Reusing a single session with different Bearer tokens gets blocked by the game's firewall.
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post(
-                    url,
-                    data=bytes.fromhex(encrypted),
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as res:
-                    return res.status
+            # Use standard SSL. Disabling SSL triggers Cloudflare security blocks.
+            async with session.post(
+                url,
+                data=bytes.fromhex(encrypted),
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as res:
+                return res.status
+        except asyncio.TimeoutError:
+            return "Timeout"
         except Exception as e:
-            print(f"Request error: {e}")
-            return 998
+            return type(e).__name__
 
 
 async def send_batch(uid, region, url, tokens):
     payload = create_payload(uid, region)
     encrypted = encrypt_message(payload)
 
-    # Use a semaphore to limit simultaneous connections (Max 50 at a time)
+    # Semaphore limits concurrency so Vercel does not crash
     sem = asyncio.Semaphore(50)
     
-    tasks = [send_single(sem, encrypted, t, url) for t in tokens]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    async with aiohttp.ClientSession() as session:
+        tasks = [send_single(session, sem, encrypted, t, url) for t in tokens]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Count actual HTTP 200 Success responses directly from the server
-    success = sum(1 for r in results if isinstance(r, int) and r == 200)
-    failed = len(results) - success
+    success = 0
+    failed = 0
+    debug_codes = {}
 
-    return success, failed
+    for r in results:
+        code_str = str(r)
+        debug_codes[code_str] = debug_codes.get(code_str, 0) + 1
+        
+        if r == 200:
+            success += 1
+        else:
+            failed += 1
+
+    return success, failed, debug_codes
 
 
 # ---------------- FLASK ---------------- #
@@ -161,7 +169,7 @@ def like():
         url = "https://clientbp.ggblueshark.com/LikeProfile"
 
     try:
-        success, failed = asyncio.run(send_batch(uid, server, url, batch))
+        success, failed, debug_codes = asyncio.run(send_batch(uid, server, url, batch))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -171,7 +179,8 @@ def like():
         "LikesGivenByAPI": success,
         "FailedRequests": failed,
         "TotalTokensUsed": len(batch),
-        "message": "Likes sent successfully" if success > 0 else "No likes sent"
+        "message": "Likes sent successfully" if success > 0 else "No likes sent",
+        "debug_info": debug_codes
     })
 
 
