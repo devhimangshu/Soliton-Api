@@ -87,28 +87,30 @@ def create_payload(uid, region):
 
 # ---------------- LIKE REQUEST ---------------- #
 
-async def send_single(session, sem, encrypted, token_dict, url):
+async def send_single(sem, encrypted, token_dict, url):
     token = token_dict.get("token", "")
     if not token:
         return "Missing Token"
 
+    # Exact headers from your original working code
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "Dalvik/2.1.0",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Connection": "close"  # Bypasses Cloudflare block without needing multiple sessions
+        "Content-Type": "application/x-www-form-urlencoded"
     }
 
     async with sem:
         try:
-            # Use standard SSL. Disabling SSL triggers Cloudflare security blocks.
-            async with session.post(
-                url,
-                data=bytes.fromhex(encrypted),
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as res:
-                return res.status
+            # We create a brand new ClientSession for every token.
+            # This mimics your original code and prevents the 503 firewall block.
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    data=bytes.fromhex(encrypted),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as res:
+                    return res.status
         except asyncio.TimeoutError:
             return "Timeout"
         except Exception as e:
@@ -119,12 +121,11 @@ async def send_batch(uid, region, url, tokens):
     payload = create_payload(uid, region)
     encrypted = encrypt_message(payload)
 
-    # Semaphore limits concurrency so Vercel does not crash
+    # Semaphore limits concurrency so Vercel does not crash from too many open sockets
     sem = asyncio.Semaphore(50)
     
-    async with aiohttp.ClientSession() as session:
-        tasks = [send_single(session, sem, encrypted, t, url) for t in tokens]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [send_single(sem, encrypted, t, url) for t in tokens]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     success = 0
     failed = 0
